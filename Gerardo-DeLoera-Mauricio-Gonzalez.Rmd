@@ -1,0 +1,931 @@
+---
+title: "DRUG-seq for miniaturized high-throughput transcriptome profiling in drug discovery"
+subtitle: "Transcriptomic Profiling of Homoharringtonine-Induced Differential Gene Expression Against DMSO Controls"
+author: |
+  | Gerardo Hernán De Loera Chávez (N.2183918) & Mauricio González Santoyo (N.2182654)
+  | Next Generation Sequencing
+  | Università Di Padova
+date: "2026-05-25"
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    latex_engine: xelatex
+---
+```{r setup, include=FALSE}
+library(knitr)
+
+opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  error = TRUE,
+  cache = TRUE,
+  dev = "pdf",          
+  fig.width = 6,        
+  fig.height = 4,       
+  fig.align = "center", 
+  fig.pos = "H",        
+  out.width = "85%"     
+)
+```
+
+University of Padova
+
+Department of Biology (DiBio)
+
+Quantitative and Computational Biosciences
+
+*Next Generation Sequencing*
+
+------------------------------------------------------------------------
+
+# Biological problem
+
+In this work we will tackle the comparison between DMSO and Homoharringtonine treatments with data coming from a 2018 study called `DRUG-seq for miniaturized high-throughput transcriptome profiling in drug discovery` published by the journal Nature Communications by Ye C, et al. Our objective is to implement a complete structured workflow for transcriptomic analysis combining methods from exploratory analysis, quality control, normalization, enrichment and identification of differentially expressed genes, gene set analysis and biological interpretation considering the results provided by the original authors after their study.
+
+With this in mind, in order to have a better understanding of the context of the data set that will be used for the analysis, the primary objective of the dataset study was to develop and validate the methodology of Digital RNA with pertUrbation of Genes (DRUG-seq), which is a high-throughout, miniaturized RNA sequencing platform optimized for large-scale drug discovery. The main difference between this method and a traditional RNA-seq approach is that from the start, the authors designed DRUG-seq to  reduce library preparation costs and intensive workflows for bigger experiments, the main validation approach was to prove that DRUG-seq captures genome-wide expression dynamics and can accurately group perturbations based on the Mechanism of Action (MoA) even with its relative sequencing depth.
+
+
+------------------------------------------------------------------------
+
+# Experimental design
+
+## Wet lab protocol
+The experimental workflow for DRUG-seq enphasizes automation and specialized chemistry, beginning from the cell lysis, where cells are treated with the given compounds directly within high-density plates with a format of 384 or 1536 wells. After incubation, traditional processing and RNA purification is completely omited moving directly to lysis. After this, reverse transcription reaction is immediately induced, where the reverse transcription primers contain a barcode to record the sample origin and a random sequence acting as a Unique Molecular Index sequence. During sample pooling and pre-amplification, a template-switching oligo binds to the generated cDNA, where once the first strand contains its well barcode, all other samples from the multi-well plate are pooled into a single tube in order to continue with PCR pre-amplification. After amplification, the pooled library undergoes an enzymatic fragmentation and adaptor insertion with a further final enrichment, the sequencing is made paired-end.
+
+## Library size
+As previously mentioned, a shallow read depth is intrinsic of this methodology, the study reported their benchmark validation with 2 million reads/well and 13 million reads/well; A standard population RNA-seq has in average 40 million reads per sample. After comparing the two sequencing depths, the authors demonstrated diminishing returns in the scaling to bigger depths, concluding that one to two million reads per well is sufficient to map responses and mechanism of action clustering.
+
+## Material and methods
+The article is completely MIAME compliant, the authors provide the full experimental design factors from cell and compound treatment,  sample and cell details and configuration, as well as their assessment of potential contamination, they provide the raw sequencing files as well as index mapping for the barcodes, UMI configuration and computational analysis followed.
+
+------------------------------------------------------------------------
+
+# Exploratory analysis
+
+Data loading
+
+```{r}
+data <- readRDS("/opt/omicsdata/datasets/SRP162188.rds")
+```
+
+Libraries on environment
+
+```{r, messages = FALSE}
+library(omicsdata)
+library(limma)
+library(EDASeq)
+library(edgeR)
+library(dplyr)
+library(plyr)
+library(corrplot)
+library(ggfortify)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(cluster)
+library(knitr)
+library(DESeq2)
+library(clusterProfiler)
+library(pathview)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(enrichplot)
+library(ggnewscale)
+library(ggupset)
+library(ggridges)
+
+BiocManager::install("variancePartition")
+library(variancePartition)
+```
+
+Characteristics of our dataset.
+
+-   63,856 genes.
+
+-   70 samples.
+
+```{r}
+dim(assay(data))
+```
+
+Given the goal of comparing samples treated with DMSO (control) or Homoharringtonine (treatment), the dataset was filtered keeping only the samples with this attribute in their metadata space `data@colData$sra.sample_attributes`. From the original 70 samples, it remained 18 DMSO control samples and 9 samples treated with Homoharringtonine.
+
+```{r}
+matches <- grep("DMSO|Homoharringtonine", data@colData$sra.sample_attributes)
+data <- data[, matches]
+table(data@colData$sra.sample_attributes)
+```
+
+## Baseline filtering
+
+Transcriptomic data as it is obtained now, is characterized by their zipfy distribution, raw counts are scarce for many genes. Across the samples, there may be just a few reads in total, contrasting with a few genes that have an enormous amount of reads. This creates an imbalance in scale proportion and it has to be tackled through different methods in order to capture the real properties of the data. For now, a first approach is setting a hard filter where genes that don't have at least ten counts across all samples are removed. We implement this below, going from 63,856 genes to 47,624 genes.
+
+```{r}
+data <- data[rowSums(assay(data))>=10,]
+raw_count <- assay(data, "raw_counts")
+dim(assay(data))
+```
+
+## Boxplot
+
+A boxplot is a tool that represents raw count median and interquartile range for each sample. This allows us to visualize the distribution of the reads, symmetry among them and possible outliers. For reasons that were explained before, logarithmic scaling such as logarithm of raw count plus 1 (log1p) is needed in order to appreciate the real spread, whereas if not implemented, most values would be extremely close to zero and no variance would be appreciable.
+
+```{r}
+raw_count <- assay(data, "raw_counts")
+col <- as.factor(data$sra.sample_attributes)
+levels(col) <- c(1:2)
+
+my_colors <- c("aquamarine3", "violet")
+plotcolors <- my_colors[col]
+
+
+boxplot(log1p(raw_count), 
+        col = plotcolors, 
+        xlab = "",
+        ylab = "log1p expression", 
+        ylim = c(0, 20),  
+        las = 2, 
+        cex.axis = 0.7)
+legend("top", 
+       legend = c("DMSO","Homoharringtonine"), 
+       col = my_colors, 
+       pch = 20, 
+       cex = 0.7, 
+       ncol = 2)
+```
+
+Having visualized said boxplot, we could note the variability in our data correctly, along with a peculiar sample `SRR7880259` that seemed very different from the representation of the other samples, even among the ones from its same class. To investigate further the consecuences of the presence of this sample, we do a principal component analysis.
+
+## PCA
+
+```{r}
+data_pca <- prcomp(t(log1p(raw_count)))
+autoplot(data_pca)
+```
+
+The sample `SRR7880259` is therefore considered an outlier and completely removed from our dataset, the reason is that it completely shifts our data variability, making the first (and strongest) principal component to separate it from the other samples just adding noise and shifting the real values we want to measure, we won't show the rest of the exploratory analysis that we made with said outlier to see the impact it caused in our dataset, however, we expect that this PCA plot is enough evidence to support its removal.
+
+```{r}
+outlier_id <- "SRR7880259"
+data <- data[, colnames(data) != outlier_id]
+raw_count <- raw_count[, colnames(raw_count) != outlier_id]
+```
+
+```{r}
+data_pca <- prcomp(t(log1p(raw_count)))
+tmp <- summary(data_pca)
+
+pc1_var <- round(tmp$importance[2, 1] * 100, 2)
+pc2_var <- round(tmp$importance[2, 2] * 100, 2)
+
+TYPE <- sub(".*treatment;;", "", data$sra.sample_attributes)
+
+ggplot(data_pca, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = TYPE), size = 2) +
+  scale_color_manual(values = my_colors) +
+  theme_classic() +
+  labs(
+    x = paste("PC1 (", pc1_var, "% Variance)"),
+    y = paste("PC2 (", pc2_var, "% Variance)"),
+    title = "PCA after outlier removal"
+  )
+```
+
+Now that the outlier was removed, we can appreciate how the first principal component separates our two sample groups better, meaning that removing it helped us identify the real biological differences between control and treatment without having a noise corrupting our data.
+
+## MA plot
+
+MA and MD plots helps us visualize trends in our data such as systematic experimental bias. The plot represents the expression of a gene in a logFC manner, against its average number of counts in a log scale. This means that we would expect, in an unbiased situation, most of the genes close to the central zero line, meaning that all of the genes variance sits closer to one another in order to make adequate comparisons between them and that there is no bias towards expression comparisons with very low average count genes. The trend in the form of a 'banana' shown in the resulting plot below, indicates a systematic bias, therefore, a need for normalization on our dataset.
+
+```{r}
+limma::plotMA(log1p(raw_count), main = "MA Plot", xlab = "A", ylab = "M", col=)
+```
+
+To visualize better the bias in the dataset we can isolate the comparison between two samples from the same group and plot their mean-difference plot. As we can see below, even between two samples 4 and 5 of the same control group, we see a trend shown as a line downwards, indicating that as the average amount of reads increases, the expression tends to have a negative trend, where we would expect the point to stay closer to the zero line in an unbiased case.
+
+```{r}
+MDPlot(raw_count, c(4,5))
+```
+
+## RLE
+
+A stronger and global tool to visualize the quality and trends in our data, as well as the diagnosis of normalization needs in our data is the relative log expression plot, this graph show us the distribution in log scale of the expression of genes relative to the median expression of the same gene across all samples. In unbiased and correctly normalized cases, all sample boxplots would be close to the zero line. The plot below shows again a need for normalization.
+
+```{r}
+plotRLE(raw_count, outline = FALSE, las = 2,
+        ylab = "RLE", main = "RLE of raw counts", col = plotcolors)
+```
+
+## GC content
+
+Library preparation and further PCR amplification can induce systematic bias in our data in the form of skewed representation of gene expression measurements in reads with different proportion of Guanine and Cytosine content. To visualize this effect, we can use the tools provided by the `EDAseq` package. Below the methodology for this analysis.
+
+```{r}
+# #We first create a new object called 'ensid' where we will use the corresponding ID 
+# of every gene in order to later cross reference them with all the genes available 
+# on the NCBI database. We subset the values in order to eliminate the version 
+# parameters and have an exact match between genes.
+
+ensid <- as.character(rowRanges(data)$gene_id)
+ensid <- substr(ensid, 1, 15)
+
+# #We create the match object 'gc' with the information of our genes present 
+# in the NCBI database with help from the EDAseq function 
+# 'getGeneLengthAndGCContent'.
+
+gc <- getGeneLengthAndGCContent(id = ensid, org = "hg38", mode = "org.db")
+
+#We remove the instances where there was no match in the NCBI database.
+
+gc <- gc[!is.na(gc[, 2]), ]
+
+# #We add the resulting Gene ID information cross-referenced 
+# with NCBI to our dataset metadata as a new column.
+
+rowData(data)$ensid <- ensid
+
+# #We then remove the genes without gc content information from our dataset and update 
+# our raw count object to only account for genes where we have this information.
+
+data <- data[rowData(data)$ensid  %in% rownames(gc), ]
+
+raw_count <- assay(data, "raw_counts")
+row.names(raw_count) <- row.names(gc)
+```
+
+```{r}
+#We make sure there are no duplicates
+
+table(duplicated(row.names(raw_count)))
+```
+
+Now, to visualize the gc content we create a `SeqExpressionSet` object from the `EDAseq` package and plot it with a logarithmic scale.
+
+```{r}
+set <- newSeqExpressionSet(raw_count,
+phenoData = AnnotatedDataFrame(data.frame(conditions = factor(1:ncol(raw_count)),
+row.names = colnames(raw_count))),
+featureData = AnnotatedDataFrame(data.frame(gc = gc[, 2], l = gc[, 1])))
+
+s <- EDASeq::biasPlot(set, "gc", ylim = c(0, 10), log = TRUE)
+```
+
+This plot represents all samples with a different colored curve across different GC proportions. As we mentioned, we want this trends to be similar among them in order to be able to do correct comparisons without a systematic bias affecting our analysis, but as we can visualize, in this case, the different trends indicate a need for a normalization step that tackles this bias.
+
+## Log-ratio across GC content
+
+Another form of visualization of said bias is plotting the expression for a given pair of samples of the same group compared across the different GC content values. In an unbiased situation we wouldnt expect a trend that depends on this content, therefore the log-expression boxplots would remain centered around zero, as seen below, this isn't the case for our samples as they are now.
+
+```{r}
+lrt <- log(raw_count[, 1] + 1) - log(raw_count[, 3] + 1)
+biasBoxplot(lrt, gc[, 2], outline = FALSE, 
+            xlab = "GC-content", ylab = "Gene expression", 
+            las = 2, cex.axis = 0.5)
+```
+
+------------------------------------------------------------------------
+
+# Normalization
+
+The exploratory analysis showed a general image of how our data-set is behaving with the experimental data obtained by the researchers. Even though the identification of an outlier helped to obtained more normally distributed values, normalization must still be performed to correct for any biases introduced during the experimental procedures.
+
+The MA plot created during the exploratory analysis a great downward shift below the 0.0 threshold of the *log expression difference* axis, when it should be expected that the values distribute around that value. Also, the gc content graph showed bias within samples that must be normalized with within samples normalization. After this, different methods for global normalization can be explored to fit our data accordingly.
+
+## Within samples normalization
+
+The within-samples normalization is necessary for GC-content bias. The graph constructed with the cleaned gc content values and gene labels created during the exploratory analysis is shown below. Also considering the boxplots created
+
+```{r}
+before <- biasPlot(set, "gc", ylim = c(0, 10), log = TRUE)
+```
+
+By using *EDASeq's* `withinLaneNormalization()` and choosing an upper quantile normalization, the graphical behaviour can be seen in a similar plot as the one shown above.
+
+```{r}
+wt <- withinLaneNormalization(set, "gc" , which = "upper", offset = TRUE)
+
+after <- biasPlot(wt, "gc", ylim=c(0,10), log = TRUE)
+```
+
+Normalization within samples significally improved the distribution of the gc content. The samples now follow a similar trend. Even though the **cyan** sample is somewhat separated, it still follows the trend as the other samples.
+
+## Between samples normalization
+
+Similarly, normalization between samples can be performed
+
+After the within sample normalization we can compute the between normalization, using **edgeR** package. Since now we have created an object called **wt**, we can access the normalized counts created. TMM normalization was chosen as a method for global normalization. The RLE plot of the **EDASeq** package was used to visualize how the geometric mean behaves when using our normalized data.
+
+```{r}
+raw_count <- normCounts(wt)
+
+lbs <- calcNormFactors(raw_count, method = "TMM")
+tmm <- cpm(raw_count, lib.size = lbs * colSums(raw_count))
+```
+
+### TMM
+
+Visualization of the expression matrix after TMM normalization.
+
+```{r}
+boxplot(log2(tmm + 1), outline=FALSE,  las=2,
+        ylab = "log(count+1)", main = "Boxplot TMM", xaxt = 'n')
+```
+
+### RLE plot
+
+The RLE plot of the **EDASeq** package was used to visualize how the geometric mean behaves when using our globally (and previously within sample) normalized data.
+
+```{r}
+lbs <- calcNormFactors(raw_count, method = "RLE")
+rle <- cpm(raw_count, lib.size = lbs * colSums(raw_count))
+
+col <- as.factor(data$sra.sample_attributes)
+levels(col) <- c(1:3)
+
+EDASeq::plotRLE(tmm, outline = FALSE,  las=2, col=col,
+        ylab = "RLE", main = "RLE TMM", xaxt='n')
+```
+
+## Correlation plot
+
+Given the TMM normalization, we can now visualize the correlation plot constructed with the Pearson correlation indexue of the expression between each of the normalized counts of the samples. The index is obtained within the *corrplot* function shown in the image below.
+
+```{r}
+colnames <- colnames(tmm)
+colnames(tmm) <- substr(colnames(tmm), 9, 12)
+m <- cor(log1p(tmm))
+
+corrplot(m, method = "color", order = 'hclust', tl.cex=0.2)
+```
+
+We can see a high correlation obtained after the normalization and data cleaning of an outlier. To show the difference we can estimate the correlation matrix of our raw data, where the biases and poorer quality of the direct experimental data is more visible.
+
+```{r}
+raw_data <- readRDS("/opt/omicsdata/datasets/SRP162188.rds")
+raw_data <- raw_data[, matches]
+
+raw_correlation_matrix <- cor(log1p(assay(raw_data, "raw_counts")))
+
+colnames(raw_correlation_matrix) <- substr(colnames(raw_correlation_matrix), 9, 12)
+rownames(raw_correlation_matrix) <- substr(rownames(raw_correlation_matrix), 9, 12)
+
+corrplot(raw_correlation_matrix, 
+         method = "color", 
+         order = 'hclust', 
+         tl.cex = 0.2)
+```
+
+## Principal component analysis with normalized data
+
+Running a second PCA using our normalized data stored within *tmm* gives insight about how our data is clustering and shows evidence of the effect of the experimental treatment compared with the DMSO control samples.
+
+```{r}
+data_pca <- prcomp(t(log1p(tmm)))
+
+ggplot(data_pca, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = TYPE), size = 2)+
+  scale_color_manual(values = my_colors)
+```
+
+```{r}
+summary(data_pca)
+```
+
+Since the first two principal componentes account for almost 90% of the variation, this pca manages to represent robustly the behaviour of this multidimensional data. The DMSO samples are tightly clusterd on the left, vastly separated from the Homoharringtonine experimental group, showing a clear indication that the normalized data is clustering correctly.
+
+## MA visualization after normalization
+
+Since the MA plot clearly allowed us to visualize our bias experimental data, running another with our normalized data should show a major visual improvement.
+
+```{r}
+limma::plotMA(log1p(tmm), main = "MA Plot", xlab = "A", ylab = "M", col=)
+```
+
+Our normalized data is mostly clustered around 0.0 in the M axis, showing a clear improvement and significant erradication of bias.
+
+------------------------------------------------------------------------
+
+# Differentially expressed genes
+
+Now that we have successfully normalized our data, a proper analysis of the difference in gene expression between our two groups, control and treatment (DMSO and Homoharringtonine, respectively) can be made. However, before starting, we can take a step back and visualize other property of RNA-seq data that heavily influences the approach we take to make analysis and get information out of our results.
+
+## Mean-variance relationship
+
+With the help of the `edgeR` package we can visualize a mean-variance scatter plot, where the points above a black continuous line represent our overdispersed data points, with variance different from the one expected of replicating experiments under a Poisson model, therefore, we captured the real biological signal we wanted, as well as identifying that our samples, as expected from transcriptomic data, follow a negative binomial trend, shown in the blue line, as the variance of the genes increase quadratically with the increase of mean gene expression. Below the methodology followed.
+
+```{r}
+#We initialize a design matrix for our genes 
+#depending on categorical group they come from.
+data$sra.samples_attributes <- as.character(data$sra.sample_attributes)
+
+design <- model.matrix(~ sra.sample_attributes, data = colData(data))
+
+#We then create a 'DGEList' object with our raw count values, which is the object that 
+# once normalized and processed will contain our differentially expressed genes.
+
+dge <- DGEList(assay(data, "raw_counts"))
+
+#We calculate our normalization factors using TMM and we estimate the samples dispersion 
+#given its sample group using the before created design matrix.
+
+dge <- calcNormFactors(dge, method="TMM")
+dge <- estimateDisp(dge, design)
+
+#Similar to the baseline filter we made at the beggining, we let EdgeR remove 
+# the low count genes across samples with a stricter statistical threshold. 
+# Later we update the library sizes after having filtered our quality genes.
+
+keep <- filterByExpr(dge, design = design)
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+
+#Then, we plot our datapoints to be able to see the trend they follow.
+
+plotMeanVar(dge, show.raw.vars = TRUE, show.ave.raw.vars = F, NBline = TRUE, 
+            show.tagwise.vars = TRUE)
+```
+
+## Identification of differentially expressed genes
+
+Now that we have completely filtered and normalize our genes in function of their expression. We can finally do a proper statistical test to discover with genes changed between the groups with statistical sinificance. For this, we will make use of a generalized linear model that accounts for the negative binomial trend that our data follows.
+
+First, we make use of the `glmFit` function to fit avery gene on our data into a negative binomial generalized linear model according to the design matrix we created before-hand.
+
+```{r}
+fit <- glmFit(dge, design)
+```
+
+Now that we created our model that account for gene expression, library size, normalization factor and biological variability, we can run our Likelihood Ratio Statistical Test (`glmLRT`) from the same package in order to, based on the fit we made, find statistical differences between our groups.
+
+```{r}
+res <- glmLRT(fit, coef=2)
+topTags(res, sort.by="logFC")
+```
+
+We visualized the top differentially expressed genes in terms of Log fold change in the `topTags` object. We then turn this gene list into a table in the `tab` object in order to filter our gene list further.
+
+```{r}
+tab <- topTags(res, n=Inf)$table
+
+de <- tab[tab$FDR <0.05 & abs(tab$logFC) > 2, ]
+dim(de)
+```
+
+Our final list of differentially expressed genes is `de`, accounting for 3048 genes. This amount comes from the decision to keep only the genes with expression over 2 in logfold change and an FDR (p-value for multiple testing) lower than 0.05.
+
+## Diagnostics and variance validation
+
+Before fully exploring this differentially expressed gene list and what they represent for our biological problem, we can make one more quality control step in order to be certain that these genes are behaving in the way we hope in order to make conclusions later. As we have followed this workflow, we didn't stop to wonder the implication of filtering the samples that aren't part of our biological problem or if there is a confounding factor in our data that went unnoticed. An example of this could be a batch effect in our samples, where if it were the case, depending on the time, preparation and overall circumstance of the batch process, we would have our expression values shifted by this parameter, but by this point, we want to make the assumption that all the differential expression we have on the genes comes only from the treatment effect of the drug. To discard such presence of bias, we can make use of the `VariancePartition` package, that help us identify if our data have multiple sources of biological and technical variation. The way this package works is by fitting a regression model (linear mixed model)for each gene separately given an input of variables from our metadata, so later it can compute the fraction of variance explained by each variable if given or summarized in the form of residuals.
+
+First, we created an object containing the biological variables of our metadata `metadata_df`.
+
+```{r}
+metadata_df <- as.data.frame(colData(data))
+```
+
+Having identified the dosage of treatment as a possible confounding variable by looking at the metadata and from the experiment description by the original article, we will make use of the column `sra_sample_title` since it contains both treatment, dose and an extra replicate \_1,2,3 value, so we separate it in different columns to test this variables.
+
+```{r}
+tmp <- as.character(metadata_df$sra.sample_title)
+
+metadata_df$Treatment <- as.factor(sub("_.*", "", tmp))
+metadata_df$Dose      <- factor(sapply(strsplit(tmp, "_"), `[`, 2), 
+                                levels = c("0nM", "100nM", "1000nM", "10000nM"))
+```
+
+### Correlation analysis
+
+Out of the tools provided by the package, first we use the Canonical Correlation Plot, in order to see if the variables we want to test, `Treatment` and `Dose` have colinearity. Canonical correlation pairs works similarly to a Pearson correlation analysis, but instead of working with continous variables, variancePartition works with categorical variables in the model as well. According to the documentation, this analysis assesses the degree to which they co-vary and contain the same information and returns the pairwise correlation matrix.
+
+```{r correlation_matrix_plot, fig.width=8, fig.height=8, out.width='60%', fig.align='center'}
+C <- canCorPairs(~ Treatment + Dose, metadata_df)
+
+# We visualize the matrix
+variancePartition::plotCorrMatrix(C, margins = c(6, 6), cexRow = 0.8, cexCol = 0.8)
+```
+
+
+The resulting array above shows a perfect colinearity between our `Treatment` and `Dose` variables, this means that our regression models cannot predict whether the expression come from the `Treatment` effect or the `Dose` effect because they are the same, they are not two separate pieces of information. As for the explanation on why this colinearity comes into place, we can look at the experimental setup: a sample can only have a value of 100nM, 1000nM, or 10000nM if it belongs to the treatment group, while all control samples are fixed at 0nM.
+
+### Variance Partition
+
+Now that we know that one variable can predict the other, there is no need to treat them as separate, so for further analysis we can take a `Treatment_Dose` object that accounts for both of them in order to not violate standard multi-variable assumptions.
+
+We will make use of the variance partition tool provided by the package in order to quantify exactly how much of the global transcriptomic variation is directly driven by our experimental conditions versus random background noise. Using a log-transformed, TMM-normalized expression matrix to strip away technical library-size artifacts, the way it works is by fitting an individual linear regression model for every single gene across the genome, partitioning its total variation into fractions explained by Treatment_dose and unexplained Residuals.
+
+```{r}
+#We create a unified variable to test
+metadata_df$Treatment_Dose <- as.factor(sub("_[0-9]+$", "", tmp))
+
+#According to the methodology we need as an input an already normalized array, 
+#so we transform raw counts to a normalized log2-CPM matrix.
+expr_matrix <- cpm(dge, log = TRUE, prior.count = 1)
+
+#We fit the model with our created matrix, indicating the form that we want to fit 
+#our model with; the Treatment_Dose variable as our parameter and the context
+#information from the metadata_df object.
+varPart_data <- fitExtractVarPartModel(expr_matrix, ~ Treatment_Dose, metadata_df)
+
+#We generate the global violin distribution plot
+plotVarPart(sortCols(varPart_data))
+```
+
+The result of the variance partition represented above in the violin plot tell us that, looking at the variance across all samples in the experiment (also the ones not considered for our biological question), the variation across `Treatment_Dose` explains a median of about 63% of the variation in expression. Whereas the rest of the variation, summarized in the `Residuals`, correspond to baseline cellular variation and housekeeping genes whose expression profiles remain completely flat and unaffected by the drug treatment, meaning that this biological fluctuations are captured in this object.
+
+### Statistical vs Variance explanatory Cross-Validation
+
+As a completely independent analysis, we decided to compare the variance partition information given by this package and the list of differentially expressed genes we were able to capture with edgeR, therefore, we performed a cross-validation, plotting said statistical significance given by our `edgeR` workflow against the newly obtained information about the variance correspondence for every gene in the experiment.
+
+```{r}
+#In order to not change the already created objects that could be used for
+#more analysis downstream, we will create separate objects
+#containing the same information.
+
+#First, we created clean copies of the expression of all the genes 
+#from 'tab' and removed the version decimals from Ensembl IDs
+tab_clean <- tab
+rownames(tab_clean)     <- gsub("\\..*", "", rownames(tab_clean))
+rownames(varPart_data)  <- gsub("\\..*", "", rownames(varPart_data))
+
+#Then, we created the intercept object containing 
+#the gene names common between our data.
+common_genes       <- intersect(rownames(tab_clean), rownames(varPart_data))
+p_values           <- tab_clean[common_genes, "PValue"]
+treatment_variance <- varPart_data[common_genes, "Treatment_Dose"] * 100
+
+#We created a data frame where for every common gene as a row,
+#we have its -log10 scale p-value in one column and its 
+#variance proportion in the other.
+plot_df <- data.frame(
+  LogP = -log10(p_values),
+  VarianceExplained = treatment_variance,
+  row.names = common_genes
+)
+
+#We now can keep only the 3048 DEG's obtained by edgeR with the
+#confidence level of FDR<0.05 and logFC greater than 2
+deg_names    <- rownames(tab_clean[tab_clean$FDR < 0.05 & abs(tab_clean$logFC) > 2, ])
+degs_only_df <- plot_df[rownames(plot_df) %in% deg_names, ]
+
+#Finally, we generate the cross-validation plot
+ggplot(degs_only_df, aes(x = LogP, y = VarianceExplained)) +
+  geom_point(color = "orange2", alpha = 0.4, size = 1.8) +
+  geom_hline(yintercept = 50, linetype = "dashed") +
+  theme_classic() +
+  labs(
+    title = "Variance Profile of DEGs",
+    x = "edgeR Statistical Significance -log10(P-Value)",
+    y = "% Variance Explained by Treatment_Dose"
+  )
+```
+
+With this plot, we have subsetted the 3048 genes obtained by edgeR and plot them with respect of their p-value in a logarithmic scale over the x-axis and their variance explained by the treatment_dose effect over the y-axisS. As we can observe, the plot shows a consensus where the vast majority of high responsive genes (shown as the significance increases along the x-axis), cluster toward the top of the plot well above a 50% threshold. This tells us that as significance increases, the more the expression is explained solely by our treatment, iving us a certainty that the features we measure are really completely governed by our treatment_dose effect, which is exactly the assumption we want to consider.
+
+### PCA overlay
+
+As a final visual validation of our explanatory model, we generated a Principal Component Analysis focused exclusively on our 3,048 high-confidence drug-responsive genes.
+
+```{r}
+#We first recovered the ID of our 3048 differentially expressed genes
+original_deg_ids <- rownames(tab[tab$FDR < 0.05 & abs(tab$logFC) > 2, ])
+
+#We make sure that the IDs don't have their version information
+clean_deg_ids <- gsub("\\..*", "", original_deg_ids)
+clean_expr_rownames <- gsub("\\..*", "", rownames(expr_matrix))
+
+#We construct the normalized matrix of DEGs
+deg_expr_matrix <- expr_matrix[clean_expr_rownames %in% clean_deg_ids, ]
+
+#We run the PCA strictly on the filtered DEG subset matrix
+pca_deg_subset <- prcomp(t(deg_expr_matrix))
+
+#We extract the coordinates and calculate the PC variance proportion
+pca_matrix <- pca_deg_subset$x
+var_explained <- pca_deg_subset$sdev^2 / sum(pca_deg_subset$sdev^2) * 100
+pc1_deg_var   <- round(var_explained[1], 2)
+pc2_deg_var   <- round(var_explained[2], 2)
+
+#We prepare the Treatment and Dose values to plot them as labels
+treatment_vector <- sub("_.*", "", metadata_df$sra.sample_title)
+dose_vector <- sapply(strsplit(as.character(metadata_df$sra.sample_title), "_"), `[`, 2)
+dose_vector <- factor(dose_vector, levels = c("0nM", "100nM", "1000nM", "10000nM"))
+
+#We create the environment for the PCA plot
+plot_pca_df <- data.frame(
+  PC1 = pca_matrix[, "PC1"],
+  PC2 = pca_matrix[, "PC2"],
+  Treatment = factor(treatment_vector),
+  Dose = dose_vector
+)
+
+#We run the PCA
+ggplot(plot_pca_df, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = Treatment, shape = Dose), size = 3.5, alpha = 0.8) +
+  scale_color_manual(values = c("DMSO" = "aquamarine3", "LEE837" = "orange2")) +
+  theme_classic() +
+  labs(
+    x = paste("PC1 (", pc1_deg_var, "% )"),
+    y = paste("PC2 (", pc2_deg_var, "% )"),
+    title = "PCA DEG's",
+    color = "Treatment",
+    shape = "Dose"
+  )
+```
+
+The principal component analysis above tells us that, looking only at the information provided by our standardized differentially expressed genes, 64.2% percent of their variance can be explained in separating the Control and Treatment variables as well as the dosis effect which, for regression models can't be separated for its high colinearity, leaving the rest of the variance to artifacts, fluctuations, and as seen in the low proportion delegated to the second principal component, separating a control sample that slightly deviates from the rest. This only assure us the absence of biases, and even more surprising, confirms the results of the Variance Partition analysis, since that model assigned approximately 63% of the variance to our Treatment_Dose object, this validates our result because PCA and the Variance Partition model work in completely different ways and they both arrived at the same result.
+
+## MA plot
+
+Now that we have validated and cross-referenced our list of differentially expressed genes, we can star to visualize them with some useful plots that help us understand their characteristics. One of these is the MA plot which we have seen before twice. Now, feeding it our DEG list, we can identify the up-regulated, down-regulated and No signal genes from our list. They span across a long spectrum in the logCPM scale, meaning that our list isnt biased against a specific abundance of counts and the treatment effect acts in a wide variety of specifications, this is also shown in the y-axis, where the up and down regulated clouds are well balanced and fairly symetrical across the board. This means that Homoharringtonine causes a systematic response from the cell for regulation through different pathways.
+
+```{r}
+plotMD(res, main = "MA plot for DEG's")
+```
+
+## Volcano plot
+
+A volcano plot is a graphical representation of log FoldChange against -log10(PValue), in other words, magnitude of expression change against statistical confidence. At the left of the plot, we have the down regulated genes colored in blue and in the right part we have the up regulated genes colored in red. In the y-axis we have the confidence levels, in which the expression is explained by the treatment. The extremely high values in the y-axis indicate a correct consistency between replicates, whereas the genes in the lateral extremes of the plot represent a massive change induction by the treatment.
+
+```{r}
+names <- row.names(de)
+
+tab$sign <- NA
+tab$sign[tab$logFC < 0] <- "Down"
+tab$sign[tab$logFC > 0] <- "Up"
+tab$sign[tab$FDR >= 0.05] <- "NoSig"
+tab$gene <- rownames(tab)
+
+ggplot(tab, aes(x = logFC, y = -log10(PValue), color = sign)) + geom_point() + theme_classic() +
+  scale_color_manual(values = c("Down" = "blue", "Up" = "red", "NoSig" = "black")) +
+  geom_text_repel(data = tab[1:20, ], aes(label = gene), size = 2.5, max.overlaps = 20)
+```
+
+## P-value distribution
+
+Now, we plot a p-value distribution histogram, where we expect a peak on low values and after that an uniform distribution. Thi plot shows us that we captured the true biological sign of the effect of the treatment, since the vast majority of the density of p=values lies in the 0.0 to 0.05 threshold since those are our significant values and the rest of the distribution is close to a uniform distribution, meaning that the biological fluctuations have equal probability of ocurring.
+
+```{r}
+hist(tab$PValue, main="p-values distribution")
+```
+
+## Cluster Analysis
+
+To continue with the exploration and quality control validation of our differentially expressed genes, we can look at cluster analysis methods, that hel us understand the relationship between the variables and expression parameters.
+
+### Heatmaps
+
+First, we used the TMM-normalized matrix and selected only the 3048 differentially expressed genes. From there, we generated a clustering expression heatmap. This plot confirms our previous results, since it generated, with a dendogram shown in the top, an exact clustering of the DMSO samples and the Homoharringtonine. Also, the left dendrogram separates our genes by their relative distance between expression and a baseline calculated across all 27 samples. In this way, we can see how, for DMSO, the block shown in the left, the gene expression are up-regulated in comparison with the baseline, whereas in the Homoharringtonine, the expression is completely shifted to down-regulation. The exact thing happens in the case of down-regulated genes in the DMSO samples compared to the baseline, because in the case of Homoharringtonine, those same genes are shifted to up-regulation.
+
+```{r}
+raw_count <- assay(data, "raw_counts")
+lbs <- calcNormFactors(raw_count, method = "TMM")
+tmm <- cpm(raw_count, lib.size = lbs * colSums(raw_count))
+
+data_degs <- tmm[names, ]
+
+Col <- data.frame(Subtype=sub(".*treatment;;", "", data$sra.sample_attributes))
+rownames(Col) <- colnames(data)
+
+our_colors = list(Subtype = c("DMSO"="aquamarine3","Homoharringtonine"="orange2"))
+
+g <- pheatmap(log1p(data_degs), show_colnames = FALSE, scale = "row", show_rownames = FALSE,
+         drop_levels = TRUE, annotation_colors = our_colors, annotation_col = Col)
+```
+
+### Silhouette index
+
+The cutree function allows us to cut the dendrogram generated before in the top heatmap and calculate its silhouette index, where we have a quantitative measure of how good is the clustering in the created groups. This index goes from -1 to +1, where the greater the positive value, the greater cohesion the items in the groups have between them. In our case, our average silhouette width of 0.8 indicates a robust clustering and strong structure. The absence of a negative silhouette gives us evidence of a lack of technical noise, probably being shadowed by the strong effect of the treatment.
+
+```{r}
+cut <- cutree(g$tree_col, k = 2)
+
+dist_mat <- dist(t(log1p(data_degs)))
+plot(silhouette(cut, dist_mat), col = c("#66CDAA", "#EE7600"), border=NA)
+```
+
+------------------------------------------------------------------------
+
+# Gene Set Analysis
+
+Now that it is clear that the experimental Homoharringtonine group clusters differently than the DMSO control group and the list of differentially expressed genes was obtained successfully, further analyses need to be done to understand the function of these genes. By comapring these genes with groups of genes that are responsible for certain biological functions an estimation of the processes and pathways.
+
+## ORA Method
+
+In order to analyze the pathways and mechanisms of action that are being regulated by our identified DEG list Over-Representation Anallysis (ORA) was implemented. It works by inputting a list of genes of interest, in our case the DEG list, and a universe to compare them to, in this case all the quantified genes stored in the *tab* variable. By using databases with different defined pathways and mechanisms regultaed by a gene ser, the designated libraries can ilustrate which of them are truly being up or down regulated within our experimental sample.
+
+The ORA method computes the probability that a certain gene is being differentially expressed and that it also belongs to a specific gene set that regulates a specific mechanism. It works by analysing if a given gene is being statistically over-represented in the DEG list. In order to implement it, we defined our universe with the gene ID's stored in our *tab* variable and defined our list of DEG ID's stored in our *de* variables that contained the genes that were filtered by the threshold mentioned in the article's methodology.
+
+```{r}
+universo <- row.names(tab)
+sign <- row.names(de)
+universo <- substr(universo, 1, 15)
+sign <- substr(sign, 1, 15)
+
+universo.entrez <- mapIds(org.Hs.eg.db,
+                    keys = universo,
+                    column = "ENTREZID",
+                    keytype = "ENSEMBL")  
+
+sign.entrez <- mapIds(org.Hs.eg.db,
+                    keys = sign,
+                    column = "ENTREZID",
+                    keytype = "ENSEMBL")
+universo.entrez <- as.character(universo.entrez)
+sign.entrez <- as.character(sign.entrez)
+
+length(sign.entrez)
+length(universo.entrez)
+```
+
+### KEGG pathways
+
+One of the mentioned databases is the KEGG pathway. This is a collection of curated metabolic pathways that aim to link the present genes in a given list within a given universe to show molecular interaction, reaction and relation networks for metabolism, genetic and environmental information processing, cellular processes, organismal systems, human diseases and drug development. Using the ID vectors in our universe and sign variables we can estimate the enrichment scores in the available KEGG pathways as follows:
+
+```{r}
+kk <- enrichKEGG(gene = sign.entrez,
+                 universe = universo.entrez,
+                 organism = 'hsa',
+                 keyType = 'ncbi-geneid',
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod = "BH")
+dim(kk)
+```
+
+The KEGG database yielded 40 main pathways being regulated by the input DEGs. With some graphing tools we can see the terms ranked by the number of genes involved in the analysis.
+
+```{r}
+barplot(kk) #Useful to appreciate the most representative genes sets.
+dotplot(kk) #Useful to see which pathway has the most genes present in the results.
+cnetplot(kk) #Useful to see gene overlap between terms and identify multi-pathway genes
+```
+
+The top ranking genes are related to signaling molecules and interaction, others are related to inmnue diseases and one is related to an infectious disease. We can analyse how one of the pathways is being regulated, let's take a look at how the Cytokine-Cytokine receptor interaction is being regulated by our genes.
+
+```{r}
+pathview(gene.data = sign.entrez, pathway.id = "hsa04060", species = "hsa")
+knitr::include_graphics("hsa04060.pathview.png")
+```
+
+In the shown pathway we can see highly significant up-regulated DEG that are present in the Cytokine-Cytokine Receptor Interaction. According to the specifications given by the The Molecular Signatures Database (MSigDB) cytokines are extra cellular proteins that serve as regulators and mobilizers of cells engaged in a diverse range of processes (cell growth and differentiation, cell death and repair proccesses to restore homoestasis to name a few). They are released by various cells as a response to an activating stimulus. Since homoharringtonine serves as a translation inhibtor, it makes sense that a cascade of responses affect this particular pathway; a harsh stress is being produced in the cell because of this inhibition.
+
+### Reactome database
+
+Similarly to the analysis done with KEGG, Reactome is another database with much more uploaded pathways ordered in a connected hierarchichal structure. Performing the same analysis with our universe and DEGs list we can see which of the reactome pathways are being regulated.
+
+```{r}
+kk <- enrichPathway(gene = sign.entrez,
+                 universe = universo.entrez,
+                 organism = 'human',
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod = "BH")
+```
+
+We can visualize it further by the same graphs employed in the previous KEGG analysis.
+
+```{r}
+barplot(kk)
+dotplot(kk)
+cnetplot(kk)
+```
+
+Similarly, the Peptide-ligand-binding receptors gene set is being regulated by our genes. Since the homoharringtonine clustered with the translation mechansism (in the original paper) and it functions as a translation inhibition, the reactome pathway is indicating that this process is being directly affected by the presense of homoharringtonine in the experimental sample.
+
+### Gene Ontology categories
+
+Another database employed is the Gene Ontology. This database groups processes by three cattegories:Biological Process (BP) the Molecular function (MF) and the Cellular component (CC). We can use the same defined IDs to explore how the molecular function is being regulated in the homoharringtonine treatment.
+
+```{r}
+ego <- enrichGO(gene = sign.entrez,
+              universe = universo.entrez,
+              OrgDb = 'org.Hs.eg.db',
+              keyType = "ENTREZID",
+              ont = "MF",
+              pvalueCutoff = 0.05,
+              pAdjustMethod = "BH",
+              readable = TRUE)
+```
+
+And also visualize it with the same graphs.
+
+```{r}
+barplot(ego)
+dotplot(ego)
+cnetplot(ego)
+```
+
+We can see that similar mechanisms appeared also in the Gene Ontology database. Particularly, receptor ligand activity related to protein synthesis and signalling pathways that are also inhibited due to the translation alteration like the signalling receptor activator and the cytokine activity. All of these factors are clear indicators of the translation inhibition and the generated cascade of consequences in downstream pathways.
+
+## GSEA
+
+An alternate way of determining which genes are being regulated in the pathways mentioned before is the Gene Set Enrichment Analysis. Instead of defining a significance treshold, like what it was done in the previous section and aligning with what was done on the article, this method compares the difference between the distribution of a given gene agians the overall distribution of the defined gene universe. A test statistic per gene is performed and the vector containing the results is sorted. However, since the size of the gene set affects deeply the enrichment score, this value is normalized with the gene universe size. Up-regulated genes will present higher enrichment scores, whilst down-regulated genes will behave in an opposite manner. Since the test statistic determines which genes are really diferentially expressed, there's no need to create a *sign* variable; the method calculates it solely on the quantified genes list stored in *tab*.
+
+```{r}
+tt <- tab$logFC
+names(tt) <- universo.entrez
+#Just a double check to eliminate possible duplicated genes before 
+#using the gene set databases.
+table(duplicated(names(tt)))
+tt <- tt[!duplicated(names(tt))]
+
+sort_tt <- sort(tt, decreasing = TRUE)
+```
+
+### KEGG Pathways
+
+We performed the same analysis on the KEGG Pathways, but using as an input our whole gene set and letting the algorithm determine which are truly diferentially expressed.
+
+```{r}
+kk2 <- gseKEGG(geneList = sort_tt,
+              organism = "hsa",
+              pvalueCutoff = 0.05)
+```
+
+A NES \< 0 indicates a down-regulated gene pathway, whereas a NES \> 0 represents an up-regulated gene pathway. Using this to graph it we can appreciate in more detail which pathways are being up-regulated and which are being down-regulated.
+
+```{r}
+dotplot(kk2, showCategory = 3, split = ".sign") + facet_grid(.~.sign) +
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 30))
+```
+
+We can also take a look at how each gene within a particular pathway of the KEGG database is behaving. In this case, looking at the last pathways in our *kk* object, we selected the hs04519 pathway related to cadherin signalling.
+
+```{r}
+gseaplot(kk2, geneSetID = "hsa04519")
+```
+
+For example, looking at the same pathway and its position on the ranked list of genes generated by GSEA we can see how it is majorly differentially expressed and down-regulated, reaching its maximum negative peak at approximately position 18000. The enrichment score line is heavily skewed at the tail of the ranked genes, indicating the down-regulation previoulsy mentioned.
+
+### Gene ontology categories
+
+The same can be done with the gene ontology database categories, in this case selecting the Metabolic Function category as we did in the ORA analysis.
+
+```{r}
+kkGO <- gseGO(geneList = sort_tt,
+          ont = "MF",
+          OrgDb='org.Hs.eg.db',
+          keyType = "ENTREZID",
+          pAdjustMethod = "BH")
+```
+
+```{r}
+dotplot(kkGO, showCategory = 6, split = ".sign") + facet_grid(.~.sign) +
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 30))
+```
+
+------------------------------------------------------------------------
+
+# Biological interpretation
+
+One major difference between our implementation of the methodology is the fact that we included the whole list of differentially expressed genes. The authors filtered the list to only the top 1000 genes before thresholding. This meant that we most likely obtained a larger list of diferentially expressed genes, than the authors did.
+
+```{r}
+dim(de)
+```
+
+Even so, when doing the gene set analysis we realized that most of the same mechanisms were present. Whilst the authors obtained mainly mechanisms linked to transcription clustered together, we obtained more general pathways that were upstream-linked to transcription. This meant that we got a broader idea of the effects of the homoharringtonine, but still managed to pin-point the underlying mechanism related to transcription.
+
+Using the KEGG pathways categories from the GSEA analysis we can draw a picture of which processes are being up and down regulated and how they relate to what the authors investigated it in the article. We opted to use the KEGG database for the conclusions due to it having a somewhat specific sub-division that can shed light onto which processes are truly being regulated in our gene set.
+
+## Down-regulated pathways
+
+-   Glycosaminoglycan biosynthesis - chondroitin sulfate/dermatan sulfate.
+
+-   Other types of O-glycan biosynthesis.
+
+-   Mannose type O- glycan biosynthesis.
+
+-   Glycosphingolipid biosynthesis - ganglio series.
+
+They all belong to **metabolic** pathways (according to the KEGG pathways' site current classifications), particularly the Glycan biosynthesis and metabolism sub-category. N-linked glycolisation is a protein modification that is related to processes like protein folding, its half-life, interaction between cells and cells and extracellular matrix components or pathogens. They are synthesized within the Endoplasmic Reticulum and the Golgi Apparatus (Viinikangas, et.al 2021). Since the ER is strongly linked to transaltion processes within its ribosomes, our pathways are showing that when translation is inhibited all of the subsequent pathways are being down-regulated.
+
+Even though the analysis detected changes in **metabolic** pathways, they are upstream regulated by translation. Over the course of this project we have described that our experimental sample, the one treated with homoharringtonine (HHT), works as a translation inhibtitor. The paper's main focus was to compare DRUG-seq to RNA-seq to position it as a much more cost-effective sequencing tool; in order to do this certain benchmarks were used to perform that comparison. Within them, the experimental HHT group was used to identify if other Small Molecules with Unknown Target (SMUTs) will have similar mechanims of action (MoA).
+
+Figure 3a in the original article showed a TSNE plot in which multiple clusters detailing specific functions being affected in other experimental groups used in the article. In cluster II, labeled "Translation", the homoharringtonine experimental group is present. Since it was known by the authors that this was the function of the HHT, other SMUTs that grouped alognside it (like brusatol) presented similar mechanisms (Ye, et. al 2018).
+
+## Up-regulated pathways
+
+-   Drug metabolism-cytochrome p450
+
+-   Metabolism of xenobiotics by cytochrome P450
+
+-   Cytokine-cytokine receptor interaction.
+
+The first two pathways belong to the **Xenobiotics biodegradation and metabolism** pathway in the KEGG classification. Metabolizing xenobiotics facilitates the elimination of potentially harmful external compounds. The metabolism of xenobiotics occurs in two pahses; where the first one involves the functionalization reactions that act upon the functional groups of the external molecule. The following phase inovles conjunction reactions, where the functionalized xeboiotics are coupled with internal molecules to enhance solubility to excrete the alien molecules .
+
+Cytochrome p450 enzymes are present in this process, serving as catalyzers in the phase 1 metabolism, where they catalyze oxidation reactions (Ndlovu, 2024). When the HHT enters the organism, it is identified as a xenobiotic molecule, triggering the degradation mechanisms, thus **up-regulating** the production of Cythchrome p450.
+
+Cytokine-cytokine receptor interaction was mentioned previously in this report, however we now know certainly that this process is being up-regulated. When macrophages phagocytose foreign bodies, they employ cytokines to simulate antigen deppendent responses by B and T cells. Cytokine communication is often within close proximity within a tissue or between cells. Each of these cytokines are secreted by one of the cells, to provoke a response in a target set of cells by interaction of the cytokine receptors (Subramanian, Tamayo, et al. (2005), PNAS and Mootha, Lindgren, et al. (2003), Nature Genetics). The same mechanism identified in the previous pathways applies here; as an external compound like HHT is identified by the inmune system, a response is triggered within the macrophagae that try to metabolise this compound, denoted by the **up-regulation** of this pathway as well.
+
+------------------------------------------------------------------------
+
+# References
+
+-   Viinikangas, T., Khosrowabadi, E., Kellokumpu, S. (2021). *N*-Glycan Biosynthesis: Basic Principles and Factors Affecting Its Outcome. In: Pezer, M. (eds) Antibody Glycosylation. Experientia Supplementum, vol 112. Springer, Cham. <https://doi.org/10.1007/978-3-030-76912-3_7>
+
+-   Ye, C., Ho, D.J., Neri, M. *et al.* DRUG-seq for miniaturized high-throughput transcriptome profiling in drug discovery. *Nat Commun* **9**, 4307 (2018). <https://doi.org/10.1038/s41467-018-06500-x>
+
+-   Ndlovu, H. Xenobiotic Metabolism: Understanding Biotransformation Pathways, Enzymatic Mechanisms, and Multifaceted Impacts. Stem. Cell. Res. Reg. Med. (2024) 7(2). DOI: 10.37532/SRRM.2024.7(2).185-186.
+
+-   A. Subramanian, P. Tamayo, V.K. Mootha, S. Mukherjee, B.L. Ebert, M.A. Gillette, A. Paulovich, S.L. Pomeroy, T.R. Golub, E.S. Lander, & J.P. Mesirov, Gene set enrichment analysis: A knowledge-based approach for interpreting genome-wide expression profiles, Proc. Natl. Acad. Sci. U.S.A. 102 (43) 15545-15550, <https://doi.org/10.1073/pnas.0506580102> (2005). and Mootha, V., Lindgren, C., Eriksson, KF. *et al.* PGC-1α-responsive genes involved in oxidative phosphorylation are coordinately downregulated in human diabetes. *Nat Genet* **34**, 267–273 (2003). <https://doi.org/10.1038/ng1180> {cited together as per their indications in the <https://www.gsea-msigdb.org/gsea/index.jsp> website}.
