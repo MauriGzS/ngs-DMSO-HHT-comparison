@@ -13,3 +13,6 @@ Compare DMSO and Homoharringtonine treatmentsThe information is stored in the $s
 ## File name
 
 SRP162188.rds
+
+##
+De Loera Chávez Gerardo Hernán & González Santoyo Mauricio
